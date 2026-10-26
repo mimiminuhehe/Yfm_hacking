@@ -13,6 +13,7 @@
       this.roomCode = null;
       this.role = null;
       this.handlers = new Set();
+      this.pauseCounts = {};
     }
     async token() {
       if (typeof getOwnerRankClient !== 'function') throw new Error('게임 Supabase 클라이언트를 찾지 못했어.');
@@ -50,7 +51,11 @@
       ws.addEventListener('error', () => onStatus('error'));
       ws.addEventListener('message', event => {
         let data; try { data = JSON.parse(event.data); } catch { return; }
-        if (data.type === 'hello') this.role = data.role;
+        if (data.type === 'hello') { this.role = data.role; this.pauseCounts = data.room?.pauseCounts || {}; }
+        if (data.type === 'paused' && data.userId && Number.isFinite(Number(data.used))) {
+          const counts = this.pauseCounts[data.half] || (this.pauseCounts[data.half] = {});
+          counts[data.userId] = Number(data.used);
+        }
         onMessage(data); this.handlers.forEach(fn => fn(data));
       });
       return new Promise((resolve, reject) => {
@@ -60,6 +65,7 @@
       });
     }
     onMessage(fn) { this.handlers.add(fn); return () => this.handlers.delete(fn); }
+    remainingPauses(half, userId) { return Math.max(0, 3 - Number(this.pauseCounts[half]?.[userId] || 0)); }
     send(type, fields = {}) {
       if (!this.ws || this.ws.readyState !== WebSocket.OPEN) throw new Error('매치 서버와 연결되어 있지 않아.');
       this.ws.send(JSON.stringify({ type, ...fields }));
@@ -69,13 +75,16 @@
     pause() { this.send('pause'); }
     resume() { this.send('resume'); }
     emoji(emoji) { this.send('emoji', { emoji }); }
-    setHalf(half) { this.send('half', { half }); }
+    goal(data) { this.send('goal', { data }); }
+    beginHalftime() { this.send('halftime'); }
+    setHalftimeReady() { this.send('half_ready'); }
     sendTactic(data) { this.send('tactic', { data }); }
     sendSub(data) { this.send('sub', { data }); }
     sendHostState(state) { this.send('state', { state }); }
+    sendHostPositions(positions) { this.send('positions', { positions }); }
     forfeit() { this.send('forfeit'); }
     async disconnect() {
-      const ws = this.ws; this.ws = null; this.roomCode = null; this.role = null;
+      const ws = this.ws; this.ws = null; this.roomCode = null; this.role = null; this.pauseCounts = {};
       if (ws && ws.readyState < WebSocket.CLOSING) ws.close(1000, '화면 종료');
     }
   }
@@ -108,19 +117,50 @@
     $('yfm-online-ready').textContent = ready ? '준비 취소' : '준비하기';
     const host = (data.players || [])[0]?.id === myId;
     const fullAndReady = (data.players || []).length === 2 && (data.players || []).every(p => p.ready);
-    $('yfm-online-start').style.display = host && fullAndReady && data.phase !== 'playing' ? 'inline-block' : 'none';
-    $('yfm-online-room-status').textContent = data.phase === 'playing'
-      ? '매치 방이 시작됐어. 게임 경기 화면 동기화는 아직 연결 중이야.'
-      : (data.players || []).length < 2 ? '친구가 참가하면 두 명 모두 준비 버튼을 눌러줘.' : (fullAndReady ? '두 명 다 준비 완료야. 경기 화면 연결을 마무리 중이야.' : '두 명 모두 준비 버튼을 눌러줘.');
+    const start = $('yfm-online-start');
+    start.style.display = 'inline-block';
+    start.disabled = !(host && fullAndReady && data.phase === 'ready');
+    start.textContent = ['playing', 'halftime'].includes(data.phase) ? '경기 진행 중' : host ? '친선전 시작' : '방장이 시작';
+    $('yfm-online-room-status').textContent = ['playing', 'halftime'].includes(data.phase)
+      ? '경기가 이미 시작됐어.'
+      : (data.players || []).length < 2 ? '상대가 방에 참가해야 해. 참가 후 두 명 모두 준비 버튼을 눌러줘.' : !host ? '두 명이 준비하면 방장이 경기 시작 버튼을 누를 거야.' : (fullAndReady ? '두 명 다 준비 완료야. 아래 친선전 시작 버튼을 눌러줘.' : '양쪽 모두 준비 버튼을 눌러야 시작할 수 있어.');
   }
   function onRoomMessage(message) {
     if (message.type === 'hello') { renderRoom(message.room); status('매치 서버에 연결됐어.'); }
     else if (message.type === 'room_update') renderRoom(message.room);
-    else if (message.type === 'match_start') renderRoom(message.room);
-    else if (message.type === 'emoji') {
+    else if (message.type === 'match_start') {
+      renderRoom(message.room);
+      if (typeof window.startOnlineMatchFromServer === 'function') window.startOnlineMatchFromServer(message);
+    } else if (message.type === 'state') {
+      if (typeof window.applyOnlineMatchSnapshot === 'function') window.applyOnlineMatchSnapshot(message.state, message.at);
+    } else if (message.type === 'positions') {
+      if (typeof window.applyOnlineMatchPositions === 'function') window.applyOnlineMatchPositions(message.positions, message.at);
+    } else if (message.type === 'paused' || message.type === 'pause_joined' || message.type === 'pause_left') {
+      if (typeof window.setOnlinePause === 'function') window.setOnlinePause(true, message);
+    } else if (message.type === 'resume_ready') {
+      if (typeof window.setOnlinePause === 'function') window.setOnlinePause(true, message);
+    } else if (message.type === 'resumed') {
+      if (typeof window.setOnlinePause === 'function') window.setOnlinePause(false, message);
+    } else if (message.type === 'pause_limit') {
+      if (typeof window.showOnlineTacticsLimit === 'function') window.showOnlineTacticsLimit();
+    } else if (message.type === 'halftime' || message.type === 'halftime_ready') {
+      if (typeof window.setOnlineHalftime === 'function') window.setOnlineHalftime(message);
+    } else if (message.type === 'half_started') {
+      if (typeof window.startOnlineSecondHalf === 'function') window.startOnlineSecondHalf(message);
+    } else if (message.type === 'goal') {
+      if (typeof window.receiveOnlineGoal === 'function') window.receiveOnlineGoal(message);
+    } else if (message.type === 'half') {
+      if (typeof window.setOnlineHalf === 'function') window.setOnlineHalf(message.half);
+    } else if (message.type === 'tactic' || message.type === 'sub') {
+      if (typeof window.applyOnlineOpponentAction === 'function') window.applyOnlineOpponentAction(message);
+    } else if (message.type === 'forfeit') {
+      if (typeof window.applyOnlineForfeit === 'function') window.applyOnlineForfeit(message);
+    } else if (message.type === 'emoji') {
       const feed = $('yfm-online-emoji-feed'); if (feed) { feed.textContent = `${message.emoji} 상대가 감정표현을 보냈어`; setTimeout(() => { if (feed.textContent.startsWith(message.emoji)) feed.textContent = ''; }, 3000); }
+      const localId = myId || (typeof accountUser !== 'undefined' ? accountUser?.id : null);
+      if (typeof window.showOnlineEmoji === 'function') window.showOnlineEmoji(message.emoji, message.userId === localId ? 'mine' : 'opponent');
     } else if (message.type === 'player_disconnected') status('상대 연결이 끊어졌어. 상대가 다시 접속할 때까지 기다려줘.', true);
-    else if (message.type === 'error') status(message.error || '매치 서버 오류', true);
+    else if (message.type === 'error') { status(message.error || '매치 서버 오류', true); if (typeof window.rejectOnlinePause === 'function') window.rejectOnlinePause(message); }
   }
   async function currentUserId() {
     if (typeof accountUser !== 'undefined' && accountUser?.id) return myId = accountUser.id;
@@ -130,11 +170,17 @@
     return myId = data.session.user.id;
   }
   function localTeam() {
-    const roster = (typeof players !== 'undefined' ? players : []).filter(p => p.isStarting).slice(0, 11).map(p => ({
+    const ownPlayers = typeof players !== 'undefined' ? players : [];
+    const roster = ownPlayers.filter(p => p.isStarting).sort((a, b) => Number(a.slotIndex) - Number(b.slotIndex)).slice(0, 11).map(p => ({
+      id: String(p.id), slotIndex: Number(p.slotIndex) || 0,
       name: String(p.name || '선수').slice(0, 24), position: String(p.position || '-').slice(0, 4),
       ovr: Math.round(Number(typeof getCalculatedOvr === 'function' ? getCalculatedOvr(p) : p.ovr) || 0)
     }));
-    return { ownerName: (typeof accountUser !== 'undefined' && accountUser?.user_metadata?.owner_name) || '구단주', clubName: String(typeof teamName !== 'undefined' ? teamName : '내 팀').slice(0, 24), ovr: Number(typeof getTeamOvr === 'function' ? getTeamOvr() : 0) || 0, roster };
+    const bench = (typeof benchIds !== 'undefined' ? benchIds : []).map(id => ownPlayers.find(p => String(p.id) === String(id))).filter(Boolean).slice(0, 7).map(p => ({
+      id: String(p.id), name: String(p.name || '선수').slice(0, 24), position: String(p.position || '-').slice(0, 4),
+      ovr: Math.round(Number(typeof getCalculatedOvr === 'function' ? getCalculatedOvr(p) : p.ovr) || 0)
+    }));
+    return { ownerName: (typeof accountUser !== 'undefined' && accountUser?.user_metadata?.owner_name) || '구단주', clubName: String(typeof teamName !== 'undefined' ? teamName : '내 팀').slice(0, 24), formation: typeof currentFormation !== 'undefined' ? currentFormation : '4-3-3', ovr: Number(typeof getTeamOvr === 'function' ? getTeamOvr() : 0) || 0, roster, bench };
   }
   async function connectTo(code) {
     showRoom(code);
@@ -218,6 +264,7 @@
   window.yfmOnlineCreateRoom = createRoom;
   window.yfmOnlineJoinRoom = joinRoom;
   window.yfmOnlineToggleReady = toggleReady;
+  window.yfmOnlineStart = () => { try { window.yfmOnline.start(); } catch (e) { status(e.message, true); } };
   window.yfmOnlineEmoji = emoji => { try { window.yfmOnline.emoji(emoji); } catch (e) { status(e.message, true); } };
   window.yfmOnlineCopyCode = async () => { try { await navigator.clipboard.writeText(room || $('yfm-online-room-code').textContent); status('방 코드를 복사했어.'); } catch { status('코드를 길게 눌러 복사해줘.'); } };
   window.yfmOnlineLeaveRoom = async () => { await window.yfmOnline.disconnect(); room = null; $('yfm-online-room').style.display = 'none'; status('방에서 나왔어.'); };
